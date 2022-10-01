@@ -22,6 +22,7 @@ Some Example output tested on an Asus G15 with the following specifications:
 - Python 3.9
 - CUDA 11.7
 - cudNN 8.4.1
+
 The resulting output:
 ```bash
 tensorflow/core/common_runtime/gpu/gpu_device.cc:1616] Created device /job:localhost/replica:0/task:0/device:GPU:0 with 6124 MB memory:  -> device: 0, name: NVIDIA GeForce RTX 3070 Laptop GPU, pci bus id: 0000:01:00.0, compute capability: 8.6
