@@ -2,7 +2,7 @@
 name = "gpu_test"
 version = "0.1.0"
 description = ""
-authors = ["Chatrb"]
+authors = ["Charbel Abi Hana <charbel-a-h@outlook.com>"]
 
 [tool.poetry.dependencies]
 python = "3.9.14"
