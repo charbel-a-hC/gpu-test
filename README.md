@@ -40,3 +40,4 @@ GPU (s):
 GPU speedup over CPU: 26x
 
 ```
+## Benchmark
