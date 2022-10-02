@@ -3,10 +3,6 @@ import timeit
 
 device_name = tf.test.gpu_device_name()
 if device_name != '/device:GPU:0':
-  print(
-      '\n\nThis error most likely means that this notebook is not '
-      'configured to use a GPU.  Change this in Notebook Settings via the '
-      'command palette (cmd/ctrl-shift-P) or the Edit menu.\n\n')
   raise SystemError('GPU device not found')
 
 def cpu():
