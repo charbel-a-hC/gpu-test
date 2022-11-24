@@ -5,10 +5,14 @@ description = ""
 authors = ["Charbel Abi Hana <charbel-a-h@outlook.com>"]
 
 [tool.poetry.dependencies]
-python = "3.9.14"
+python = "3.9.15"
 tensorflow-gpu = "^2.10.0"
 
 [tool.poetry.dev-dependencies]
+poethepoet = "^0.16.4"
+
+[tool.poe.tasks]
+force-cuda11 = "python -m pip install torch==1.8.0+cu111 torchvision==0.9.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
