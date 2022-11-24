@@ -8,6 +8,8 @@ gpu_available = torch.cuda.is_available()
 if not gpu_available:
     raise SystemError("Cuda device not available")
 
+CONV_OUT, KERNEL = 128, 7
+
 def cpu():
     in_channels, batch_size, W, H = 3, 32, 500, 500
     random_image_cpu = torch.randn(size= (batch_size, in_channels, W, H)).cpu()
@@ -27,7 +29,7 @@ cpu()
 gpu()
 
 # Run the op several times.
-print('Time (s) to convolve 32x7x7x3 filter over random 100x100x100x3 images '
+print(f'Time (s) to convolve {CONV_OUT}x{KERNEL}x{KERNEL}x3 filter over random 500x500x500x3 images '
       '(batch x height x width x channel). Sum of ten runs.')
 print('CPU (s):')
 cpu_time = timeit.timeit('cpu()', number=10, setup="from __main__ import cpu")
