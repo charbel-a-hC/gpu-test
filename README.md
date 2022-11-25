@@ -14,8 +14,9 @@ Finally run the script for tensorflow: `gpu_test_tf.py`:
 ```bash
 python3 gpu_test_tf.py
 ```
-Or for Pytorch:
+Or for Pytorch, you have to download `torch-cuda`, `cuda11` is supported in the `pyproject.toml` file:
 ```bash
+poe force-cuda11
 python3 gpu_test_torch.py
 ```
 
