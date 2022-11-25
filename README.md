@@ -10,9 +10,13 @@ And then activate the virtual environment in the current shell:
 ```bash
 poetry shell
 ```
-Finally run the `gpu_test.py` script:
+Finally run the script for tensorflow: `gpu_test_tf.py`:
 ```bash
-python3 gpu_test.py
+python3 gpu_test_tf.py
+```
+Or for Pytorch:
+```bash
+python3 gpu_test_torch.py
 ```
 
 ## Example Output
