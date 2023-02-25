@@ -5,7 +5,7 @@ description = ""
 authors = ["Charbel Abi Hana <charbel-a-h@outlook.com>"]
 
 [tool.poetry.dependencies]
-python = "3.9.15"
+python = "3.9.*"
 tensorflow-gpu = "^2.10.0"
 
 [tool.poetry.dev-dependencies]
