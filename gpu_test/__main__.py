@@ -11,20 +11,28 @@ from __future__ import annotations
 import argparse
 import sys
 
-import torch
 
-
-def _cmd_bench(_args: argparse.Namespace) -> None:
+def _cmd_bench(args: argparse.Namespace) -> None:
     from gpu_test.benchmark import run
-    run()
+    from gpu_test.report import default_filename, write_csv
+
+    results = run()
+
+    out = args.output or default_filename()
+    path = write_csv(results, out)
+    print(f"\n  📄 CSV report → {path}")
 
 
 def _cmd_stress(args: argparse.Namespace) -> None:
-    from gpu_test.stress import run, _build_parser
+    from gpu_test.report import default_filename, write_csv
+    from gpu_test.stress import run
 
-    # Forward relevant args
     stress_ns = argparse.Namespace(tests=args.tests, duration=args.duration)
-    run(stress_ns)
+    results = run(stress_ns)
+
+    out = args.output or default_filename()
+    path = write_csv(results, out)
+    print(f"\n  📄 CSV report → {path}")
 
 
 def _cmd_info(_args: argparse.Namespace) -> None:
@@ -53,7 +61,8 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── bench ──
-    sub.add_parser("bench", help="Run smart benchmark suite (6 AI workloads)")
+    bench_p = sub.add_parser("bench", help="Run smart benchmark suite (6 AI workloads)")
+    bench_p.add_argument("--output", "-o", type=str, default=None, help="CSV output path (default: auto-timestamped)")
 
     # ── stress ──
     stress_p = sub.add_parser("stress", help="Run full stress-test suite (10 tests)")
@@ -65,6 +74,7 @@ def main() -> None:
         help="Tests to run (default: all)",
     )
     stress_p.add_argument("--duration", type=int, default=30, help="Sustained-test duration (s)")
+    stress_p.add_argument("--output", "-o", type=str, default=None, help="CSV output path (default: auto-timestamped)")
 
     # ── info ──
     sub.add_parser("info", help="Print GPU details + telemetry snapshot")

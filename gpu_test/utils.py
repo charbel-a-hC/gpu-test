@@ -10,7 +10,8 @@ import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Generator
+from datetime import datetime, timezone
+from typing import Any, Generator
 
 import torch
 
@@ -100,18 +101,57 @@ def cleanup(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
-# ── Benchmark result ────────────────────────────────────────────────────────
+# ── Test result ─────────────────────────────────────────────────────────────
 
 
 @dataclass
-class BenchResult:
-    """Structured result from a single workload run."""
+class TestResult:
+    """Structured result from a single test run on a single GPU.
 
-    name: str
-    device: str
-    elapsed_s: float
-    throughput: str = ""
-    extra: dict = field(default_factory=dict)
+    Fields:
+        suite:      "bench" or "stress"
+        test_name:  human-readable test label
+        gpu_index:  device index
+        gpu_name:   device name
+        status:     "ok", "oom", or "error"
+        elapsed_s:  wall-clock seconds
+        metrics:    test-specific key→value (e.g. tok_per_s, tflops, gb_per_s)
+        config:     parameters that were used (batch, seq_len, etc.)
+        telemetry:  NVML readings captured during the test
+        timestamp:  ISO 8601 when the result was recorded
+    """
+
+    suite: str
+    test_name: str
+    gpu_index: int
+    gpu_name: str
+    status: str = "ok"
+    elapsed_s: float = 0.0
+    peak_vram_gb: float = 0.0
+    # Per-test targeted metrics
+    metrics: dict[str, Any] = field(default_factory=dict)
+    # Config params used for this run
+    config: dict[str, Any] = field(default_factory=dict)
+    # NVML telemetry (filled by monitor)
+    telemetry: dict[str, Any] = field(default_factory=dict)
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def summary_line(self) -> str:
+        """One-line summary for console output."""
+        m = "  ".join(f"{k}={v}" for k, v in self.metrics.items())
+        c = "  ".join(f"{k}={v}" for k, v in self.config.items())
+        parts = [f"GPU {self.gpu_index}: {m or self.status}"]
+        if self.elapsed_s > 0:
+            parts.append(f"{self.elapsed_s:.3f}s")
+        if self.peak_vram_gb > 0:
+            parts.append(f"peak VRAM={self.peak_vram_gb:.1f}GB")
+        if c:
+            parts.append(f"({c})")
+        return "  ".join(parts)
+
+
+# For backward compat — alias
+BenchResult = TestResult
 
 
 # ── Formatting helpers ──────────────────────────────────────────────────────

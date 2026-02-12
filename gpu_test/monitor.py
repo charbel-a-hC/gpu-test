@@ -233,12 +233,14 @@ class Monitor:
 # ── Convenience for other modules ───────────────────────────────────────────
 
 
-def run_monitored(gpu_index: int, fn, *args, nvml_ok: bool = False, **kwargs):
-    """Run *fn* while optionally sampling GPU telemetry.  Print stats after."""
+def run_monitored(gpu_index: int, fn, *args, nvml_ok: bool = False, **kwargs) -> tuple:
+    """Run *fn* while optionally sampling GPU telemetry.
+
+    Returns ``(fn_result, MonitorStats | None)``.
+    """
     if nvml_ok:
         with Monitor(gpu_index=gpu_index, interval=0.1) as mon:
             result = fn(*args, **kwargs)
-        if mon.stats.samples > 0:
-            print(f"    ⚡ {mon.stats.summary()}")
-        return result
-    return fn(*args, **kwargs)
+        return result, mon.stats
+    return fn(*args, **kwargs), None
+

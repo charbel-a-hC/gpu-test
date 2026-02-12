@@ -1,5 +1,8 @@
 .DEFAULT_GOAL := help
 
+# Pass extra args via ARGS=  e.g.  make stress ARGS="--tests throughput kv_cache --duration 120"
+ARGS ?=
+
 # ── Docker ───────────────────────────────────────────────────────────────────
 
 .PHONY: build up down logs bench stress info
@@ -16,11 +19,11 @@ down: ## Stop all services
 logs: ## Follow container logs
 	docker compose logs -f
 
-bench: build ## Run benchmark suite
-	docker compose run --rm gpu-bench
+bench: build ## Run benchmark suite (ARGS= for extra flags)
+	docker compose run --rm gpu-bench gpu-test bench $(ARGS)
 
-stress: build ## Run full stress-test suite
-	docker compose run --rm gpu-stress
+stress: build ## Run stress suite (ARGS="--tests all --duration 60")
+	docker compose run --rm gpu-stress gpu-test stress $(ARGS)
 
 info: build ## Print GPU info + telemetry snapshot
 	docker compose run --rm gpu-info
@@ -32,11 +35,11 @@ info: build ## Print GPU info + telemetry snapshot
 install: ## Install locally via uv
 	uv venv && uv pip install -e ".[dev]"
 
-test: ## Run benchmark locally
-	python -m gpu_test bench
+test: ## Run benchmark locally (ARGS= for extra flags)
+	python -m gpu_test bench $(ARGS)
 
-test-stress: ## Run stress suite locally
-	python -m gpu_test stress
+test-stress: ## Run stress suite locally (ARGS= for extra flags)
+	python -m gpu_test stress $(ARGS)
 
 test-info: ## Print GPU info locally
 	python -m gpu_test info
@@ -48,6 +51,7 @@ lint: ## Syntax check all modules
 	python3 -m py_compile gpu_test/monitor.py
 	python3 -m py_compile gpu_test/benchmark.py
 	python3 -m py_compile gpu_test/stress.py
+	python3 -m py_compile gpu_test/report.py
 	@echo "✓ All modules OK"
 
 # ── Help ─────────────────────────────────────────────────────────────────────

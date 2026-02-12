@@ -2,6 +2,8 @@
 
 Each workload starts with aggressive parameters and automatically reduces them
 on OOM, safely finding the maximum stress point for each GPU.
+
+Returns structured ``TestResult`` objects; ``run()`` returns the full list.
 """
 
 from __future__ import annotations
@@ -10,17 +12,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gpu_test.monitor import run_monitored, init as nvml_init, shutdown as nvml_shutdown, snapshot
+from gpu_test.monitor import (
+    MonitorStats, init as nvml_init, run_monitored, shutdown as nvml_shutdown, snapshot,
+)
 from gpu_test.utils import (
-    BenchResult, GpuDevice, banner, cleanup, cuda_timer, detect_gpus, note, print_header,
+    GpuDevice, TestResult, banner, cleanup, cuda_timer, detect_gpus, note, print_header,
 )
 
 
+# ── Telemetry helper ────────────────────────────────────────────────────────
+
+
+def _telem_dict(stats: MonitorStats | None) -> dict:
+    """Convert MonitorStats to a flat dict for the CSV."""
+    if stats is None or stats.samples == 0:
+        return {}
+    return {
+        "avg_gpu_util_pct": round(stats.avg_gpu_util, 1),
+        "peak_gpu_util_pct": round(stats.peak_gpu_util, 1),
+        "peak_mem_gb": round(stats.peak_mem_gb, 1),
+        "avg_power_w": round(stats.avg_power_w, 0),
+        "peak_power_w": round(stats.peak_power_w, 0),
+        "avg_temp_c": round(stats.avg_temp_c, 0),
+        "peak_temp_c": stats.peak_temp_c,
+        "peak_clock_mhz": stats.peak_clock_gpu_mhz,
+        "samples": stats.samples,
+    }
+
+
 # ── Workloads ────────────────────────────────────────────────────────────────
+# Each returns (TestResult, MonitorStats | None)
 
 
-def _transformer_block(device: torch.device, n_iters: int = 10) -> BenchResult:
-    """Multi-head self-attention + FFN (LLM / ViT core)."""
+def _transformer_block(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool, n_iters: int = 10,
+) -> TestResult:
     configs = [
         {"d_model": 4096, "n_heads": 32, "seq_len": 8192, "batch": 16},
         {"d_model": 4096, "n_heads": 32, "seq_len": 4096, "batch": 16},
@@ -43,25 +69,39 @@ def _transformer_block(device: torch.device, n_iters: int = 10) -> BenchResult:
 
             with torch.no_grad():
                 h = ln1(x); h, _ = attn(h, h, h); h = x + h; h = h + ffn(ln2(h))
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            torch.cuda.synchronize(device)
 
-            with cuda_timer(device) as elapsed:
-                with torch.no_grad():
-                    for _ in range(n_iters):
-                        h = ln1(x); h, _ = attn(h, h, h); h = x + h; h = h + ffn(ln2(h))
+            stats: MonitorStats | None = None
+
+            def _work():
+                nonlocal stats
+                with cuda_timer(device) as elapsed:
+                    with torch.no_grad():
+                        for _ in range(n_iters):
+                            h2 = ln1(x); h2, _ = attn(h2, h2, h2); h2 = x + h2; h2 = h2 + ffn(ln2(h2))
+                return elapsed
+
+            elapsed, stats = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
 
             tokens = cfg["batch"] * cfg["seq_len"] * n_iters
             tps = tokens / elapsed[0] if elapsed[0] > 0 else 0
-            return BenchResult("Transformer Block", str(device), elapsed[0], f"{tps:,.0f} tok/s", cfg)
+            peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            return TestResult(
+                suite="bench", test_name="Transformer Block", gpu_index=gpu.index, gpu_name=gpu.name,
+                elapsed_s=elapsed[0], peak_vram_gb=peak,
+                metrics={"tok_per_s": round(tps), "tokens_total": tokens, "iters": n_iters},
+                config=cfg, telemetry=_telem_dict(stats),
+            )
         except torch.cuda.OutOfMemoryError:
-            note(f"OOM at batch={cfg['batch']} seq={cfg['seq_len']} d={cfg['d_model']}, reducing…")
+            note(f"OOM at batch={cfg['batch']} seq={cfg['seq_len']}, reducing…")
             cleanup(device)
-    return BenchResult("Transformer Block", str(device), 0, "all configs OOM")
+
+    return TestResult(suite="bench", test_name="Transformer Block", gpu_index=gpu.index, gpu_name=gpu.name, status="oom")
 
 
-def _sdpa_attention(device: torch.device, n_iters: int = 10) -> BenchResult:
-    """Scaled dot-product / flash attention at long context (BF16)."""
+def _sdpa_attention(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool, n_iters: int = 10,
+) -> TestResult:
     seq_lengths = [65536, 32768, 16384, 8192, 4096]
     n_heads, head_dim, batch = 32, 128, 4
 
@@ -70,55 +110,75 @@ def _sdpa_attention(device: torch.device, n_iters: int = 10) -> BenchResult:
         try:
             q = torch.randn(batch, n_heads, seq_len, head_dim, dtype=torch.bfloat16, device=device)
             k, v = torch.randn_like(q), torch.randn_like(q)
-
             with torch.no_grad():
                 _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            torch.cuda.synchronize(device)
 
-            with cuda_timer(device) as elapsed:
-                with torch.no_grad():
-                    for _ in range(n_iters):
-                        _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            def _work():
+                with cuda_timer(device) as elapsed:
+                    with torch.no_grad():
+                        for _ in range(n_iters):
+                            _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+                return elapsed
 
+            elapsed, stats = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
             tokens = batch * seq_len * n_iters
             tps = tokens / elapsed[0] if elapsed[0] > 0 else 0
-            return BenchResult(
-                "SDPA / Flash Attention (BF16)", str(device), elapsed[0], f"{tps:,.0f} tok/s",
-                {"seq": seq_len, "heads": n_heads, "head_dim": head_dim, "batch": batch},
+            peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            return TestResult(
+                suite="bench", test_name="SDPA / Flash Attention (BF16)",
+                gpu_index=gpu.index, gpu_name=gpu.name,
+                elapsed_s=elapsed[0], peak_vram_gb=peak,
+                metrics={"tok_per_s": round(tps), "seq_len": seq_len},
+                config={"seq_len": seq_len, "heads": n_heads, "head_dim": head_dim, "batch": batch},
+                telemetry=_telem_dict(stats),
             )
         except torch.cuda.OutOfMemoryError:
             note(f"OOM at seq_len={seq_len}, reducing…")
             cleanup(device)
-    return BenchResult("SDPA / Flash Attention (BF16)", str(device), 0, "all configs OOM")
+
+    return TestResult(suite="bench", test_name="SDPA / Flash Attention (BF16)", gpu_index=gpu.index, gpu_name=gpu.name, status="oom")
 
 
-def _large_matmul(device: torch.device, n_iters: int = 10) -> BenchResult:
-    """Large GEMM (BF16) — LLM forward-pass bottleneck."""
+def _large_matmul(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool, n_iters: int = 10,
+) -> TestResult:
     sizes = [(32768, 32768, 16384), (16384, 16384, 16384), (16384, 16384, 8192), (8192, 8192, 8192)]
     for m, n, k in sizes:
         cleanup(device)
         try:
             a = torch.randn(m, k, device=device, dtype=torch.bfloat16)
             b = torch.randn(k, n, device=device, dtype=torch.bfloat16)
-            _ = torch.mm(a, b)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            with cuda_timer(device) as elapsed:
-                for _ in range(n_iters):
-                    _ = torch.mm(a, b)
+            _ = torch.mm(a, b); torch.cuda.synchronize(device)
+
+            def _work():
+                with cuda_timer(device) as elapsed:
+                    for _ in range(n_iters):
+                        _ = torch.mm(a, b)
+                return elapsed
+
+            elapsed, stats = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
             flops = 2 * m * n * k * n_iters
             tflops = flops / (elapsed[0] * 1e12) if elapsed[0] > 0 else 0
-            return BenchResult("Large GEMM (BF16)", str(device), elapsed[0], f"{tflops:.1f} TFLOPS",
-                               {"shape": f"[{m}×{k}] @ [{k}×{n}]"})
+            peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            return TestResult(
+                suite="bench", test_name="Large GEMM (BF16)",
+                gpu_index=gpu.index, gpu_name=gpu.name,
+                elapsed_s=elapsed[0], peak_vram_gb=peak,
+                metrics={"tflops": round(tflops, 2), "flops_total": flops},
+                config={"M": m, "N": n, "K": k},
+                telemetry=_telem_dict(stats),
+            )
         except torch.cuda.OutOfMemoryError:
-            note(f"OOM at [{m}×{k}] @ [{k}×{n}], reducing…")
+            note(f"OOM at [{m}×{k}]@[{k}×{n}], reducing…")
             cleanup(device)
-    return BenchResult("Large GEMM (BF16)", str(device), 0, "all configs OOM")
+
+    return TestResult(suite="bench", test_name="Large GEMM (BF16)", gpu_index=gpu.index, gpu_name=gpu.name, status="oom")
 
 
-def _mixed_precision_train(device: torch.device, n_iters: int = 10) -> BenchResult:
-    """Full forward + backward with AMP (mixed precision training step)."""
+def _mixed_precision_train(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool, n_iters: int = 10,
+) -> TestResult:
     configs = [
         {"d_model": 4096, "n_heads": 32, "seq_len": 4096, "batch": 16},
         {"d_model": 4096, "n_heads": 32, "seq_len": 2048, "batch": 16},
@@ -138,28 +198,38 @@ def _mixed_precision_train(device: torch.device, n_iters: int = 10) -> BenchResu
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
                 out = layer(x)
-            out.sum().backward(); opt.zero_grad()
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
+            out.sum().backward(); opt.zero_grad(); torch.cuda.synchronize(device)
 
-            with cuda_timer(device) as elapsed:
-                for _ in range(n_iters):
-                    opt.zero_grad()
-                    with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
-                        out = layer(x)
-                    scaler.scale(out.sum()).backward()
-                    scaler.step(opt); scaler.update()
+            def _work():
+                with cuda_timer(device) as elapsed:
+                    for _ in range(n_iters):
+                        opt.zero_grad()
+                        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
+                            out2 = layer(x)
+                        scaler.scale(out2.sum()).backward()
+                        scaler.step(opt); scaler.update()
+                return elapsed
 
+            elapsed, stats = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
             sps = n_iters / elapsed[0] if elapsed[0] > 0 else 0
-            return BenchResult("Mixed-Precision Training", str(device), elapsed[0], f"{sps:.1f} steps/s", cfg)
+            peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            return TestResult(
+                suite="bench", test_name="Mixed-Precision Training",
+                gpu_index=gpu.index, gpu_name=gpu.name,
+                elapsed_s=elapsed[0], peak_vram_gb=peak,
+                metrics={"steps_per_s": round(sps, 2), "iters": n_iters},
+                config=cfg, telemetry=_telem_dict(stats),
+            )
         except torch.cuda.OutOfMemoryError:
-            note(f"OOM at batch={cfg['batch']} seq={cfg['seq_len']} d={cfg['d_model']}, reducing…")
+            note(f"OOM at batch={cfg['batch']} seq={cfg['seq_len']}, reducing…")
             cleanup(device)
-    return BenchResult("Mixed-Precision Training", str(device), 0, "all configs OOM")
+
+    return TestResult(suite="bench", test_name="Mixed-Precision Training", gpu_index=gpu.index, gpu_name=gpu.name, status="oom")
 
 
-def _conv_resnet(device: torch.device, n_iters: int = 20) -> BenchResult:
-    """Heavy ResNet-style conv stack at high resolution."""
+def _conv_resnet(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool, n_iters: int = 20,
+) -> TestResult:
     configs = [
         {"batch": 128, "res": 512}, {"batch": 64, "res": 512}, {"batch": 32, "res": 512},
         {"batch": 64, "res": 256}, {"batch": 32, "res": 256},
@@ -175,26 +245,38 @@ def _conv_resnet(device: torch.device, n_iters: int = 20) -> BenchResult:
                 nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(512, 1000),
             ).to(device).eval()
             x = torch.randn(cfg["batch"], 3, cfg["res"], cfg["res"], device=device)
-            with torch.no_grad():
-                _ = model(x)
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            with cuda_timer(device) as elapsed:
-                with torch.no_grad():
-                    for _ in range(n_iters):
-                        _ = model(x)
+            with torch.no_grad(): _ = model(x)
+            torch.cuda.synchronize(device)
+
+            def _work():
+                with cuda_timer(device) as elapsed:
+                    with torch.no_grad():
+                        for _ in range(n_iters): _ = model(x)
+                return elapsed
+
+            elapsed, stats = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
             ips = (cfg["batch"] * n_iters) / elapsed[0] if elapsed[0] > 0 else 0
-            return BenchResult("Conv Stack (ResNet)", str(device), elapsed[0], f"{ips:,.0f} img/s",
-                               {"batch": cfg["batch"], "res": f"{cfg['res']}×{cfg['res']}"})
+            peak = torch.cuda.max_memory_allocated(device) / 1024**3
+            return TestResult(
+                suite="bench", test_name="Conv Stack (ResNet)",
+                gpu_index=gpu.index, gpu_name=gpu.name,
+                elapsed_s=elapsed[0], peak_vram_gb=peak,
+                metrics={"img_per_s": round(ips), "iters": n_iters},
+                config={"batch": cfg["batch"], "resolution": f"{cfg['res']}x{cfg['res']}"},
+                telemetry=_telem_dict(stats),
+            )
         except torch.cuda.OutOfMemoryError:
             note(f"OOM at batch={cfg['batch']} res={cfg['res']}, reducing…")
             cleanup(device)
-    return BenchResult("Conv Stack (ResNet)", str(device), 0, "all configs OOM")
+
+    return TestResult(suite="bench", test_name="Conv Stack (ResNet)", gpu_index=gpu.index, gpu_name=gpu.name, status="oom")
 
 
-def _vram_fill(device: torch.device) -> BenchResult:
-    """Fill VRAM to measure usable capacity."""
+def _vram_fill(
+    gpu: GpuDevice, device: torch.device, nvml_ok: bool,
+) -> TestResult:
     cleanup(device)
+    torch.cuda.reset_peak_memory_stats(device)
     tensors: list[torch.Tensor] = []
     try:
         while True:
@@ -202,11 +284,16 @@ def _vram_fill(device: torch.device) -> BenchResult:
     except torch.cuda.OutOfMemoryError:
         pass
     peak_gb = torch.cuda.max_memory_allocated(device) / 1024**3
-    total_gb = torch.cuda.get_device_properties(device.index or 0).total_mem / 1024**3
-    pct = (peak_gb / total_gb) * 100
+    total_gb = gpu.vram_gb
+    pct = (peak_gb / total_gb) * 100 if total_gb > 0 else 0
     del tensors
     cleanup(device)
-    return BenchResult("VRAM Fill", str(device), 0, f"{peak_gb:.1f} / {total_gb:.1f} GB ({pct:.0f}%)")
+    return TestResult(
+        suite="bench", test_name="VRAM Fill",
+        gpu_index=gpu.index, gpu_name=gpu.name,
+        peak_vram_gb=peak_gb,
+        metrics={"filled_gb": round(peak_gb, 1), "total_gb": total_gb, "filled_pct": round(pct, 1)},
+    )
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
@@ -224,8 +311,8 @@ ALL_BENCHMARKS: list[tuple[str, callable]] = [
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 
-def run() -> None:
-    """Run all benchmarks on every detected GPU."""
+def run() -> list[TestResult]:
+    """Run all benchmarks on every detected GPU. Returns all results."""
     gpus = detect_gpus()
     nvml_ok = nvml_init()
 
@@ -236,24 +323,31 @@ def run() -> None:
         if nvml_ok:
             print(f"  {snapshot(gpu.index)}")
 
+    results: list[TestResult] = []
+
     for label, fn in ALL_BENCHMARKS:
         banner(label)
         for gpu in gpus:
             dev = torch.device(f"cuda:{gpu.index}")
             torch.cuda.reset_peak_memory_stats(dev)
             try:
-                def _work(dev=dev):
-                    return fn(dev)
-
-                result = run_monitored(gpu.index, _work, nvml_ok=nvml_ok)
-                mem_gb = torch.cuda.max_memory_allocated(dev) / 1024**3
-                extra = "  ".join(f"{k}={v}" for k, v in result.extra.items())
-                print(
-                    f"  GPU {gpu.index}: {result.throughput:<28s}  "
-                    f"{result.elapsed_s:.3f}s  peak VRAM={mem_gb:.1f}GB"
-                    + (f"  ({extra})" if extra else "")
-                )
+                result = fn(gpu, dev, nvml_ok)
+                results.append(result)
+                print(f"  {result.summary_line()}")
+                if result.telemetry:
+                    tl = result.telemetry
+                    print(
+                        f"    ⚡ GPU={tl.get('avg_gpu_util_pct', '?')}%→{tl.get('peak_gpu_util_pct', '?')}%  "
+                        f"Power={tl.get('avg_power_w', '?')}→{tl.get('peak_power_w', '?')}W  "
+                        f"Temp={tl.get('avg_temp_c', '?')}→{tl.get('peak_temp_c', '?')}°C  "
+                        f"Clock↑{tl.get('peak_clock_mhz', '?')}MHz"
+                    )
             except Exception as exc:
+                results.append(TestResult(
+                    suite="bench", test_name=label, gpu_index=gpu.index,
+                    gpu_name=gpu.name, status="error",
+                    metrics={"error": str(exc)},
+                ))
                 print(f"  GPU {gpu.index}: ERROR — {exc}")
             finally:
                 cleanup(dev)
@@ -262,5 +356,6 @@ def run() -> None:
         nvml_shutdown()
 
     print(f"\n{'=' * 72}")
-    print("  Benchmark complete.")
+    print(f"  Benchmark complete — {len(results)} results collected.")
     print(f"{'=' * 72}")
+    return results
