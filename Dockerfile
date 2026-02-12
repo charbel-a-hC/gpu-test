@@ -4,9 +4,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     TORCH_CUDA_ARCH_LIST="9.0;12.0"
 
-# ── System deps + Python 3.13 ───────────────────────────────────────────────
+# ── System deps + Python 3.13 (via deadsnakes PPA) ──────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.13 python3.13-venv python3-pip curl ca-certificates && \
+    software-properties-common curl ca-certificates && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.13 python3.13-venv python3.13-dev && \
     rm -rf /var/lib/apt/lists/* && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.13 1
 
